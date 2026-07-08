@@ -116,13 +116,14 @@ Three different mask formats are in the output: colored, indexed, and a blend of
 
 ### 6. `measure.py`
 
-It takes one of the epochs, a .pt file of your choice, and runs it on a batch of images and compares the results to a set of corresponding labels. It generates a .csv file with a pixel-level registration of true class and probabilities.
+It takes one of the epochs, a .pt file of your choice, and runs it on a batch of images and compares the results to a set of corresponding labels. It generates two .csv files: one with a pixel-level registration of true class and probabilities, another with the IoUs accross classes and the average IoU.
 
 ### 7. `plot.py`
 
-It generates a plot from a .csv file with many metrics. See an example below:
+It generates a plot from a .csv file with many metrics, and another plot with the IoUs in bars. See examples below:
 
-![image](assets/plot_example.png)
+![image](assets/metrics_example.png)
+![image](assets/iou_example.png)
 
 ## License
     Copyright [2026] [Mychel Lopes Segrini]
