@@ -1,9 +1,10 @@
 '''
 Evaluation Visualization Suite for SAM 3 Semantic Segmentation.
 
-Generates two publication-ready visualizations:
+Generates three publication-ready visualizations:
 1. A multi-class chart comparing Path, Obstacles, and Background on the same axes.
 2. An overall 'Micro-Averaged' chart evaluating the model holistically.
+3. A Bar Chart visualizing the Intersection over Union (IoU) structural metrics.
 '''
 
 import pandas as pd
@@ -123,7 +124,7 @@ def plot_multiclass_metrics(df: pd.DataFrame, col_map: Dict[int, str], save_path
     ax2.grid(True, linestyle='--', alpha=0.7)
     ax2.legend(loc='upper left', fontsize=11)
 
-    fig.suptitle('SAM 3 "Unfrozen" Semantic Segmentation (Epoch 24): Multi-Class Performance over Validation Set', 
+    fig.suptitle('SAM 3 "Unfrozen" Semantic Segmentation (Epoch 16): Multi-Class Performance over Validation Set', 
                  fontsize=18, fontweight='bold', y=0.98)
     
     plt.tight_layout()
@@ -177,34 +178,88 @@ def plot_overall_metrics(df: pd.DataFrame, col_map: Dict[int, str], save_path: s
     ax2.grid(True, linestyle='--', alpha=0.7)
     ax2.legend(loc='upper left', fontsize=12)
 
-    fig.suptitle('SAM 3 "Unfrozen" Semantic Segmentation (Epoch 24): Multi-Class Performance over Validation Set', 
+    fig.suptitle('SAM 3 "Unfrozen" Semantic Segmentation (Epoch 16): Overall Validation Performance', 
                  fontsize=18, fontweight='bold', y=0.98)
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
     print(f"Overall metrics plot saved to: {save_path}")
 
+def plot_iou_summary(csv_path: str, save_path: str) -> None:
+    """Generates a bar chart visualizing the IoU metrics from the single-epoch evaluation."""
+    if not os.path.exists(csv_path):
+        print(f"Warning: IoU summary file not found at {csv_path}. Skipping IoU plot.")
+        return
+
+    # Read the single row of IoU data
+    df = pd.read_csv(csv_path)
+    
+    path_iou = df['Path_IoU'].iloc[0]
+    obstacle_iou = df['Obstacle_IoU'].iloc[0]
+    bg_iou = df['Background_IoU'].iloc[0]
+    miou = df['mIoU'].iloc[0]
+
+    labels = ['Path IoU', 'Obstacle IoU', 'Background IoU', 'Mean IoU (mIoU)']
+    values = [path_iou, obstacle_iou, bg_iou, miou]
+    
+    # Colors mapped to match the multi-class chart and the overall line
+    colors = ['mediumseagreen', 'crimson', 'royalblue', 'indigo']
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars = ax.bar(labels, values, color=colors, alpha=0.85, edgecolor='black', linewidth=1.2)
+
+    ax.set_title('Intersection over Union (IoU) Validation Scores (Epoch 16)', fontsize=16, fontweight='bold')
+    ax.set_ylabel('IoU Score (0.0 to 1.0)', fontsize=12)
+    ax.set_ylim([0.0, 1.05])
+    
+    # Enable y-axis grid lines for readability behind the bars
+    ax.grid(axis='y', linestyle='--', alpha=0.7)
+    ax.set_axisbelow(True)
+
+    # Annotate the exact value on top of each bar
+    for bar in bars:
+        height = bar.get_height()
+        ax.annotate(f'{height:.3f}',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 5),  # 5 points vertical offset to float above the bar
+                    textcoords="offset points",
+                    ha='center', va='bottom', fontsize=12, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"IoU summary plot saved to: {save_path}")
+
 if __name__ == "__main__":
     load_dotenv()
     ROOT_PATH = os.getenv("ROOT_PATH")
+    VALIDATION_RELATIVE_PATH = os.getenv("VALIDATION_RELATIVE_PATH")
 
-    if ROOT_PATH is None:
-        raise ValueError("ROOT_PATH environment variable is not set. Please check your .env file.")
+    if ROOT_PATH is None or VALIDATION_RELATIVE_PATH is None:
+        raise ValueError("Environment variables ROOT_PATH or VALIDATION_RELATIVE_PATH are missing.")
     
-    DATA_RELATIVE_PATH = os.getenv("DATA_RELATIVE_PATH")
-
-    if DATA_RELATIVE_PATH is None:
-        raise ValueError("DATA_RELATIVE_PATH environment variable is not set. Please check your .env file.")
+    # Ensure these paths exactly match the dual outputs of measure.py
+    PIXEL_CSV_FILE = os.path.join(ROOT_PATH, VALIDATION_RELATIVE_PATH, "segmentation_pixel_metrics_val.csv")
+    IOU_CSV_FILE = os.path.join(ROOT_PATH, VALIDATION_RELATIVE_PATH, "segmentation_iou_summary.csv")
     
-    CSV_FILE = os.path.join(ROOT_PATH, DATA_RELATIVE_PATH, "segmentation_metrics_val.csv")
-    MULTICLASS_OUTPUT = os.path.join(ROOT_PATH, DATA_RELATIVE_PATH, "sam3_4_metrics_by_class.png")
-    OVERALL_OUTPUT = os.path.join(ROOT_PATH, DATA_RELATIVE_PATH, "sam3_u24_metrics_overall.png")
+    # Output file paths
+    MULTICLASS_OUTPUT = os.path.join(ROOT_PATH, VALIDATION_RELATIVE_PATH, "sam3_nu16_metrics_by_class.png")
+    OVERALL_OUTPUT = os.path.join(ROOT_PATH, VALIDATION_RELATIVE_PATH, "sam3_nu16_metrics_overall.png")
+    IOU_OUTPUT = os.path.join(ROOT_PATH, VALIDATION_RELATIVE_PATH, "sam3_metrics_iou_bar.png")
 
-    print(f"Reading evaluation metrics from {CSV_FILE}...")
-    df = pd.read_csv(CSV_FILE)
+    # 1. Process Pixel Data (PR and Calibration Curves)
+    if os.path.exists(PIXEL_CSV_FILE):
+        print(f"Reading evaluation metrics from {PIXEL_CSV_FILE}...")
+        df = pd.read_csv(PIXEL_CSV_FILE)
+        
+        # Dynamically match whatever naming convention is stored in measure.py output
+        col_map = find_probability_columns(df)
 
-    # Dynamically match whatever naming convention is stored in measure.py output
-    col_map = find_probability_columns(df)
+        plot_multiclass_metrics(df, col_map, MULTICLASS_OUTPUT)
+        plot_overall_metrics(df, col_map, OVERALL_OUTPUT)
+    else:
+        print(f"Error: {PIXEL_CSV_FILE} not found. Cannot generate PR or Calibration curves.")
 
-    plot_multiclass_metrics(df, col_map, MULTICLASS_OUTPUT)
-    plot_overall_metrics(df, col_map, OVERALL_OUTPUT)
+    # 2. Process IoU Data (Bar Chart)
+    print(f"Reading IoU metrics from {IOU_CSV_FILE}...")
+    plot_iou_summary(IOU_CSV_FILE, IOU_OUTPUT)

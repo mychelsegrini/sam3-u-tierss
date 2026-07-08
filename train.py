@@ -1,5 +1,10 @@
 """
 End-to-End Fine-Tuning for SAM3-TierSS using Layer-wise Learning Rate Decay.
+
+This script executes a robust, hardware-aware training pipeline that fine-tunes a pre-trained 
+Vision Transformer (SAM 3 Backbone) alongside a custom ASPP Neck and Decoder Head.
+It trains across multiple autonomous navigation datasets (BDD100K, Cityscapes, Mapillary)
+using Gradient Accumulation, Automatic Mixed Precision (AMP), and Intra-epoch Checkpointing.
 """
 import torch
 import torch.nn as nn
@@ -9,8 +14,9 @@ from torch.utils.data import DataLoader, ConcatDataset
 import matplotlib.pyplot as plt
 import glob
 import os
-import csv # Added for safe logging
+import csv 
 
+# Import custom architecture and dataset modules
 from sam3.model_builder import build_sam3_image_model
 from segmenter import SAM3Segmenter, SegmentationLoss
 from dataset import (
@@ -24,16 +30,27 @@ from typing import List, Dict, Any
 
 def get_parameter_groups(model: nn.Module, base_lr: float, weight_decay: float = 1e-4) -> List[Dict[str, Any]]:
     """
-    Implements Layer-wise Learning Rate Decay (LLRD) by dynamically 
-    crawling the model architecture to find the Transformer blocks.
+    Implements Layer-wise Learning Rate Decay (LLRD) for the Vision Transformer.
+    
+    Why this is needed:
+    Standard fine-tuning with a high learning rate causes "catastrophic forgetting" in 
+    pre-trained ViTs, destroying their learned foundational features. LLRD applies the 
+    highest learning rate to the newly initialized Head/Neck, and exponentially decreases 
+    the learning rate as it penetrates deeper into the frozen Backbone.
     """
     parameter_groups: List[Dict[str, Any]] = []
     
-    # 1. Custom Head and Neck (Highest LR: Training from scratch)
+    # ------------------------------------------------------------------
+    # 1. NEW LAYERS (Highest LR)
+    # The Custom Head and Neck are trained from scratch, so they get the full base_lr.
+    # ------------------------------------------------------------------
     head_neck_params = list(model.neck.parameters()) + list(model.head.parameters())
     parameter_groups.append({'params': head_neck_params, 'lr': base_lr, 'weight_decay': weight_decay})
     
-    # 2. Dynamically hunt for the Transformer blocks
+    # ------------------------------------------------------------------
+    # 2. TRANSFORMER BLOCK CRAWLER
+    # Dynamically hunt for the Transformer blocks inside the SAM 3 backbone.
+    # ------------------------------------------------------------------
     blocks = None
     for name, module in model.backbone.named_modules():
         if (name.endswith('blocks') or name.endswith('layers')) and isinstance(module, nn.ModuleList):
@@ -47,7 +64,11 @@ def get_parameter_groups(model: nn.Module, base_lr: float, weight_decay: float =
         parameter_groups.append({'params': model.backbone.parameters(), 'lr': base_lr * 0.01, 'weight_decay': weight_decay})
         return parameter_groups
 
-    # 3. Apply Decay: Deeper layers get higher LRs, shallow layers get tiny LRs
+    # ------------------------------------------------------------------
+    # 3. EXPONENTIAL DECAY APPLICATION
+    # Deeper layers (closer to the output) get higher LRs. 
+    # Shallow layers (closer to the input) get progressively tinier LRs.
+    # ------------------------------------------------------------------
     lr_decay_factor = 0.8 
     num_blocks = len(blocks)
     
@@ -55,7 +76,11 @@ def get_parameter_groups(model: nn.Module, base_lr: float, weight_decay: float =
         block_lr = (base_lr * 0.1) * (lr_decay_factor ** idx)
         parameter_groups.append({'params': block.parameters(), 'lr': block_lr, 'weight_decay': weight_decay})
         
-    # 4. Dynamically hunt for Patch Embeddings (Earliest layer, lowest LR)
+    # ------------------------------------------------------------------
+    # 4. PATCH EMBEDDINGS (Lowest LR)
+    # The very first layer of the model. It extracts basic edge/color features,
+    # so we decay it the most to lock those fundamental parameters in place.
+    # ------------------------------------------------------------------
     for name, module in model.backbone.named_modules():
         if 'patch_embed' in name:
             earliest_lr = (base_lr * 0.1) * (lr_decay_factor ** num_blocks)
@@ -67,6 +92,9 @@ def get_parameter_groups(model: nn.Module, base_lr: float, weight_decay: float =
 
 
 def main() -> None:
+    # ------------------------------------------------------------------
+    # ENVIRONMENT & PATH SETUP
+    # ------------------------------------------------------------------
     load_dotenv()
     ROOT_PATH: str = os.getenv("ROOT_PATH")
 
@@ -79,22 +107,33 @@ def main() -> None:
     SAM3_RELATIVE_PATH: str = os.getenv("SAM3_RELATIVE_PATH")
     MODEL_PATH: str = os.path.join(ROOT_PATH, SAM3_RELATIVE_PATH)
     
-    # Path for our new CSV logger
     CSV_LOG_PATH: str = os.path.join(ROOT_PATH, "metrics/epoch_losses.csv")
 
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Initializing pipeline on: {device.type.upper()}")
+
+    # ------------------------------------------------------------------
+    # MODEL, OPTIMIZER & LOSS INITIALIZATION
+    # ------------------------------------------------------------------
     base_model = build_sam3_image_model(checkpoint_path=MODEL_PATH)
     model: SAM3Segmenter = SAM3Segmenter(base_model=base_model, num_classes=3).to(device)
 
+    # AdamW is heavily preferred for ViTs over standard Adam due to better weight decay handling
     base_lr = 1e-4
     param_groups = get_parameter_groups(model, base_lr)
     optimizer: optim.AdamW = optim.AdamW(param_groups)
 
+    # Class Weights combat the massive Background bias. Obstacles (5.0) are penalized 
+    # 5x harder than Background (1.0) and ~3x harder than Path (1.5).
     class_weights: torch.Tensor = torch.tensor([1.5, 5.0, 1.0], dtype=torch.float).to(device)
     criterion: SegmentationLoss = SegmentationLoss(dice_weight=0.6, focal_weight=0.4, class_weights=class_weights)
 
+    # GradScaler prevents 16-bit float gradients from underflowing to 0 during backprop
     scaler: GradScaler = GradScaler(device)
 
+    # ------------------------------------------------------------------
+    # CHECKPOINT RECOVERY SYSTEM
+    # ------------------------------------------------------------------
     resume_checkpoint_path_from_recovery = None
     resume_checkpoint_path_from_epoch = None
     start_epoch = 0
@@ -121,11 +160,19 @@ def main() -> None:
         start_epoch = checkpoint['epoch']
         print(f"Successfully loaded. Resuming training at Epoch {start_epoch + 1}...")
 
+    # ------------------------------------------------------------------
+    # TRAINING HYPERPARAMETERS & BATCH CONFIGURATION
+    # ------------------------------------------------------------------
     num_epochs: int = 100
     
+    # Effective Batch Size = physical_batch_size * accumulation_steps (2 * 8 = 16)
+    # This simulates a 16-batch size without exceeding GPU VRAM limits.
     physical_batch_size = 2
     accumulation_steps = 8  
 
+    # ------------------------------------------------------------------
+    # UNIFIED MULTI-DOMAIN DATASET INITIALIZATION
+    # ------------------------------------------------------------------
     print("Initializing datasets...")
     bdd_dataset = BDD100KSemanticDataset(
         image_dir=os.path.join(BDD_PATH, "10k/train"),
@@ -150,44 +197,61 @@ def main() -> None:
         batch_size=physical_batch_size, 
         shuffle=True,
         num_workers=4,
-        pin_memory=True,
-        drop_last=True
+        pin_memory=True, # Speeds up CPU to GPU tensor transfers
+        drop_last=True   # Prevents BatchNorm crashes on irregular final batches
     )
 
+    # Tracking arrays for final plot generation
     tracked_epochs: list[int] = []
     tracked_losses: list[float] = []
-    save_frequency = 3000  
+    save_frequency = 3000  # Generate an emergency backup every 3000 batches
     
+    # ==================================================================
+    # CORE TRAINING LOOP
+    # ==================================================================
     for epoch in range(start_epoch, num_epochs):
-        model.train() 
+        model.train() # Unlocks Dropout and BatchNorm updates
         running_loss: float = 0.0
-        optimizer.zero_grad(set_to_none=True)
+        
+        # set_to_none=True is slightly faster and uses less memory than standard zero_grad()
+        optimizer.zero_grad(set_to_none=True) 
         
         pbar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
         
         for batch_idx, (images, masks) in enumerate(pbar):
+            # Fast-forward condition for resuming from a mid-epoch crash
             if epoch == start_epoch and batch_idx < start_batch:
                 continue
                 
             images = images.to(device)
             masks = masks.to(device).long()
             
-            # UPDATED: PyTorch 2.x standard for Automatic Mixed Precision
+            # 1. MIXED PRECISION FORWARD PASS
             with torch.autocast(device_type=device.type):
                 logits: torch.Tensor = model(images)
                 loss: torch.Tensor = criterion(logits, masks)
+                # Scale down the loss so accumulating it mathematically matches a larger batch size
                 loss = loss / accumulation_steps
                 
+            # 2. SCALED BACKWARD PASS
             scaler.scale(loss).backward()
             
+            # 3. GRADIENT ACCUMULATION & OPTIMIZER STEP
+            # Only step the optimizer once we have accumulated enough gradients
             if ((batch_idx + 1) % accumulation_steps == 0) or (batch_idx + 1 == len(train_dataloader)):
+                
+                # Unscale the gradients back to normal sizes before clipping
                 scaler.unscale_(optimizer)
+                # Gradient Clipping prevents ViT weights from exploding if a corrupted batch creates Infinite loss
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
             
+            # --------------------------------------------------------------
+            # INTRA-EPOCH EMERGENCY BACKUP
+            # --------------------------------------------------------------
             if (batch_idx + 1) % save_frequency == 0:
                 mid_epoch_save_path = os.path.join(WEIGHTS_FOLDER, f"recovery_epoch_{epoch+1}_batch_{batch_idx+1}.pt")
                 checkpoint = {
@@ -199,9 +263,13 @@ def main() -> None:
                 }
                 torch.save(checkpoint, mid_epoch_save_path)
 
+            # Re-multiply by accumulation_steps strictly for readable console logging
             running_loss += (loss.item() * accumulation_steps)
             pbar.set_postfix({"Loss": f"{(loss.item() * accumulation_steps):.4f}"})
             
+        # ==================================================================
+        # EPOCH FINALIZATION
+        # ==================================================================
         epoch_loss: float = running_loss / len(train_dataloader)
         print(f"--> Epoch {epoch+1} Completed | Average Loss: {epoch_loss:.4f}")
         
@@ -210,16 +278,18 @@ def main() -> None:
         
         # ------------------------------------------------------------------
         # SAFE CSV LOGGING
+        # Appends dynamically to protect history from terminal/server crashes
         # ------------------------------------------------------------------
         file_exists = os.path.isfile(CSV_LOG_PATH)
         with open(CSV_LOG_PATH, mode='a', newline='') as csvfile:
             writer = csv.writer(csvfile)
             if not file_exists:
-                writer.writerow(['Epoch', 'Average_Loss'])  # Create header if new file
+                writer.writerow(['Epoch', 'Average_Loss'])
             writer.writerow([epoch + 1, f"{epoch_loss:.6f}"])
-        # ------------------------------------------------------------------
 
+        # ------------------------------------------------------------------
         # MODEL SAVING (.PT)
+        # ------------------------------------------------------------------
         pt_save_path = os.path.join(WEIGHTS_FOLDER, f"full_tune_epoch_{epoch+1}.pt")
         checkpoint = {
             'epoch': epoch + 1,
@@ -229,7 +299,10 @@ def main() -> None:
         }
         torch.save(checkpoint, pt_save_path)
         
+        # ------------------------------------------------------------------
         # CLEANUP INTRA-EPOCH BACKUPS
+        # Removes the emergency backups for this epoch once the full epoch succeeds
+        # ------------------------------------------------------------------
         recovery_pattern = os.path.join(WEIGHTS_FOLDER, f"recovery_epoch_{epoch+1}_batch_*.pt")
         recovery_files = glob.glob(recovery_pattern)
         
@@ -244,6 +317,9 @@ def main() -> None:
 
         print(f"Epoch {epoch+1} saved to {pt_save_path}")
 
+    # ==================================================================
+    # TRAINING COMPLETE: GENERATE PLOTS
+    # ==================================================================
     print("\nTraining Complete! Generating Loss Curve...")
 
     plt.figure(figsize=(10, 6))

@@ -61,7 +61,7 @@ Do any modifications to the code for enhancing the head or neck, or the fine-tun
 
 The model is currently structured like this:
 
-![image](model.png)
+![image](assets/model.png)
 
 For deeper information on each of the following scripts, read their comments.
 

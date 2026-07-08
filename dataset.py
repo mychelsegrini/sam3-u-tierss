@@ -47,7 +47,7 @@ class CityscapesSemanticDataset(Dataset):
         self.image_dir: str = image_dir
         self.mask_dir: str = mask_dir
         
-        # glob recursively searches through the city subfolders and returns the FULL paths
+        # glob recursively searches through the city subfolders and returns the full paths
         self.images: List[str] = sorted(glob.glob(os.path.join(image_dir, '**', '*_leftImg8bit.png'), recursive=True))
         self.masks: List[str] = sorted(glob.glob(os.path.join(mask_dir, '**', '*_labelIds.png'), recursive=True))
         
@@ -66,7 +66,6 @@ class CityscapesSemanticDataset(Dataset):
         return len(self.images)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        # glob already provides the absolute path, so os.path.join is no longer needed here
         img_path: str = self.images[idx]
         mask_path: str = self.masks[idx]
         
@@ -101,7 +100,7 @@ class MapillarySemanticDataset(Dataset):
 # ==========================================
 # 4. Custom Local Dataset (Oversampled)
 # ==========================================
-class LisbonSidewalkDataset(Dataset):
+class CustomLocalDataset(Dataset):
     """
     Custom dataset with built-in oversampling to prevent the 
     massive global datasets from drowning out these local features.
