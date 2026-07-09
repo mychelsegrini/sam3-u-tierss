@@ -124,7 +124,7 @@ def plot_multiclass_metrics(df: pd.DataFrame, col_map: Dict[int, str], save_path
     ax2.grid(True, linestyle='--', alpha=0.7)
     ax2.legend(loc='upper left', fontsize=11)
 
-    fig.suptitle('SAM 3 "Unfrozen" Semantic Segmentation (Epoch 16): Multi-Class Performance over Validation Set', 
+    fig.suptitle('SAM 3 "Unfrozen" Semantic Segmentation (Epoch X): Multi-Class Performance over Validation Set', 
                  fontsize=18, fontweight='bold', y=0.98)
     
     plt.tight_layout()
@@ -178,7 +178,7 @@ def plot_overall_metrics(df: pd.DataFrame, col_map: Dict[int, str], save_path: s
     ax2.grid(True, linestyle='--', alpha=0.7)
     ax2.legend(loc='upper left', fontsize=12)
 
-    fig.suptitle('SAM 3 "Unfrozen" Semantic Segmentation (Epoch 16): Overall Validation Performance', 
+    fig.suptitle('SAM 3 "Unfrozen" Semantic Segmentation (Epoch X): Overall Validation Performance', 
                  fontsize=18, fontweight='bold', y=0.98)
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -208,7 +208,7 @@ def plot_iou_summary(csv_path: str, save_path: str) -> None:
     fig, ax = plt.subplots(figsize=(10, 6))
     bars = ax.bar(labels, values, color=colors, alpha=0.85, edgecolor='black', linewidth=1.2)
 
-    ax.set_title('Intersection over Union (IoU) Validation Scores (Epoch 16)', fontsize=16, fontweight='bold')
+    ax.set_title('Intersection over Union (IoU) Validation Scores (Epoch X)', fontsize=16, fontweight='bold')
     ax.set_ylabel('IoU Score (0.0 to 1.0)', fontsize=12)
     ax.set_ylim([0.0, 1.05])
     
@@ -239,12 +239,12 @@ if __name__ == "__main__":
         raise ValueError("Environment variables ROOT_PATH or VALIDATION_RELATIVE_PATH are missing.")
     
     # Ensure these paths exactly match the dual outputs of measure.py
-    PIXEL_CSV_FILE = os.path.join(ROOT_PATH, VALIDATION_RELATIVE_PATH, "segmentation_pixel_metrics_val.csv")
+    PIXEL_CSV_FILE = os.path.join(ROOT_PATH, VALIDATION_RELATIVE_PATH, "segmentation_pixel_metrics.csv")
     IOU_CSV_FILE = os.path.join(ROOT_PATH, VALIDATION_RELATIVE_PATH, "segmentation_iou_summary.csv")
     
     # Output file paths
-    MULTICLASS_OUTPUT = os.path.join(ROOT_PATH, VALIDATION_RELATIVE_PATH, "sam3_nu16_metrics_by_class.png")
-    OVERALL_OUTPUT = os.path.join(ROOT_PATH, VALIDATION_RELATIVE_PATH, "sam3_nu16_metrics_overall.png")
+    MULTICLASS_OUTPUT = os.path.join(ROOT_PATH, VALIDATION_RELATIVE_PATH, "sam3_metrics_by_class.png")
+    OVERALL_OUTPUT = os.path.join(ROOT_PATH, VALIDATION_RELATIVE_PATH, "sam3_metrics_overall.png")
     IOU_OUTPUT = os.path.join(ROOT_PATH, VALIDATION_RELATIVE_PATH, "sam3_metrics_iou_bar.png")
 
     # 1. Process Pixel Data (PR and Calibration Curves)

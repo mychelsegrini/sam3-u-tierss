@@ -211,11 +211,11 @@ def main() -> None:
     MAP_PATH = os.path.join(ROOT_PATH, MAP_PATH)
 
     # Target the specific epoch you want to measure
-    WEIGHTS_PATH: str = os.path.join(ROOT_PATH, WEIGHTS_RELATIVE_PATH, "full_tune_epoch_16.pt")
+    WEIGHTS_PATH: str = os.path.join(ROOT_PATH, WEIGHTS_RELATIVE_PATH, "full_tune_epoch_x.pt")
     SAM3_PATH: str = os.path.join(ROOT_PATH, SAM3_RELATIVE_PATH)
     
     # Dual outputs
-    pixel_csv_path: str = os.path.join(ROOT_PATH, VALIDATION_RELATIVE_PATH, "segmentation_pixel_metrics_val.csv")
+    pixel_csv_path: str = os.path.join(ROOT_PATH, VALIDATION_RELATIVE_PATH, "segmentation_pixel_metrics.csv")
     iou_csv_path: str = os.path.join(ROOT_PATH, VALIDATION_RELATIVE_PATH, "segmentation_iou_summary.csv")
 
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

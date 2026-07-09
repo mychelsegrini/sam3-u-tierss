@@ -9,6 +9,7 @@ using Gradient Accumulation, Automatic Mixed Precision (AMP), and Intra-epoch Ch
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader, ConcatDataset
 import matplotlib.pyplot as plt
@@ -18,7 +19,7 @@ import csv
 
 # Import custom architecture and dataset modules
 from sam3.model_builder import build_sam3_image_model
-from segmenter import SAM3Segmenter, SegmentationLoss
+from segmenter import SAM3Segmenter
 from dataset import (
     BDD100KSemanticDataset, 
     CityscapesSemanticDataset, 
@@ -28,29 +29,65 @@ from tqdm import tqdm
 from dotenv import load_dotenv
 from typing import List, Dict, Any
 
+class RobustSegmentationLoss(nn.Module):
+    """
+    A mathematically armored combination of Focal Loss and Dice Loss.
+    Forces all probability math into float32 and clamps extremes to prevent NaN corruption.
+    """
+    def __init__(self, dice_weight=0.6, focal_weight=0.4, class_weights=None, epsilon=1e-5):
+        super().__init__()
+        self.dice_weight = dice_weight
+        self.focal_weight = focal_weight
+        self.class_weights = class_weights 
+        self.epsilon = epsilon
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # 1. UPCAST TO FLOAT32: Prevents bfloat16 Softmax overflow
+        logits = logits.to(torch.float32)
+        
+        # 2. CALCULATE PROBABILITIES & CLAMP: Prevents log(0) in Focal Loss
+        probs = F.softmax(logits, dim=1)
+        probs = torch.clamp(probs, min=1e-6, max=1.0 - 1e-6)
+        
+        # Prepare targets (Shape: [B, C, H, W])
+        num_classes = logits.shape[1]
+        targets_one_hot = F.one_hot(targets, num_classes=num_classes).permute(0, 3, 1, 2).float()
+        
+        # Device-agnostic class weights
+        if self.class_weights is not None:
+            self.class_weights = self.class_weights.to(logits.device)
+        else:
+            self.class_weights = torch.ones(num_classes, device=logits.device)
+            
+        # --- FOCAL LOSS ---
+        ce_loss = -targets_one_hot * torch.log(probs)
+        gamma = 2.0
+        focal_term = (1.0 - probs) ** gamma
+        focal_loss = focal_term * ce_loss
+        focal_loss = focal_loss.mean(dim=(0, 2, 3)) * self.class_weights
+        focal_loss = focal_loss.mean()
+        
+        # --- DICE LOSS ---
+        intersection = torch.sum(probs * targets_one_hot, dim=(0, 2, 3))
+        union = torch.sum(probs, dim=(0, 2, 3)) + torch.sum(targets_one_hot, dim=(0, 2, 3))
+        
+        dice_score = (2. * intersection + self.epsilon) / (union + self.epsilon)
+        dice_loss = 1.0 - dice_score
+        dice_loss = (dice_loss * self.class_weights).mean()
+        
+        return self.dice_weight * dice_loss + self.focal_weight * focal_loss
+
 def get_parameter_groups(model: nn.Module, base_lr: float, weight_decay: float = 1e-4) -> List[Dict[str, Any]]:
     """
     Implements Layer-wise Learning Rate Decay (LLRD) for the Vision Transformer.
-    
-    Why this is needed:
-    Standard fine-tuning with a high learning rate causes "catastrophic forgetting" in 
-    pre-trained ViTs, destroying their learned foundational features. LLRD applies the 
-    highest learning rate to the newly initialized Head/Neck, and exponentially decreases 
-    the learning rate as it penetrates deeper into the frozen Backbone.
     """
     parameter_groups: List[Dict[str, Any]] = []
     
-    # ------------------------------------------------------------------
     # 1. NEW LAYERS (Highest LR)
-    # The Custom Head and Neck are trained from scratch, so they get the full base_lr.
-    # ------------------------------------------------------------------
     head_neck_params = list(model.neck.parameters()) + list(model.head.parameters())
     parameter_groups.append({'params': head_neck_params, 'lr': base_lr, 'weight_decay': weight_decay})
     
-    # ------------------------------------------------------------------
     # 2. TRANSFORMER BLOCK CRAWLER
-    # Dynamically hunt for the Transformer blocks inside the SAM 3 backbone.
-    # ------------------------------------------------------------------
     blocks = None
     for name, module in model.backbone.named_modules():
         if (name.endswith('blocks') or name.endswith('layers')) and isinstance(module, nn.ModuleList):
@@ -64,11 +101,7 @@ def get_parameter_groups(model: nn.Module, base_lr: float, weight_decay: float =
         parameter_groups.append({'params': model.backbone.parameters(), 'lr': base_lr * 0.01, 'weight_decay': weight_decay})
         return parameter_groups
 
-    # ------------------------------------------------------------------
     # 3. EXPONENTIAL DECAY APPLICATION
-    # Deeper layers (closer to the output) get higher LRs. 
-    # Shallow layers (closer to the input) get progressively tinier LRs.
-    # ------------------------------------------------------------------
     lr_decay_factor = 0.8 
     num_blocks = len(blocks)
     
@@ -76,11 +109,7 @@ def get_parameter_groups(model: nn.Module, base_lr: float, weight_decay: float =
         block_lr = (base_lr * 0.1) * (lr_decay_factor ** idx)
         parameter_groups.append({'params': block.parameters(), 'lr': block_lr, 'weight_decay': weight_decay})
         
-    # ------------------------------------------------------------------
     # 4. PATCH EMBEDDINGS (Lowest LR)
-    # The very first layer of the model. It extracts basic edge/color features,
-    # so we decay it the most to lock those fundamental parameters in place.
-    # ------------------------------------------------------------------
     for name, module in model.backbone.named_modules():
         if 'patch_embed' in name:
             earliest_lr = (base_lr * 0.1) * (lr_decay_factor ** num_blocks)
@@ -89,7 +118,6 @@ def get_parameter_groups(model: nn.Module, base_lr: float, weight_decay: float =
             break
             
     return parameter_groups
-
 
 def main() -> None:
     # ------------------------------------------------------------------
@@ -118,24 +146,21 @@ def main() -> None:
     base_model = build_sam3_image_model(checkpoint_path=MODEL_PATH)
     model: SAM3Segmenter = SAM3Segmenter(base_model=base_model, num_classes=3).to(device)
 
-    # AdamW is heavily preferred for ViTs over standard Adam due to better weight decay handling
     base_lr = 1e-4
     param_groups = get_parameter_groups(model, base_lr)
     optimizer: optim.AdamW = optim.AdamW(param_groups)
 
-    # Class Weights combat the massive Background bias. Obstacles (5.0) are penalized 
-    # 5x harder than Background (1.0) and ~3x harder than Path (1.5).
     class_weights: torch.Tensor = torch.tensor([1.5, 5.0, 1.0], dtype=torch.float).to(device)
-    criterion: SegmentationLoss = SegmentationLoss(dice_weight=0.6, focal_weight=0.4, class_weights=class_weights)
+    # Using the new robust loss class defined above
+    criterion: RobustSegmentationLoss = RobustSegmentationLoss(dice_weight=0.6, focal_weight=0.4, class_weights=class_weights)
 
-    # GradScaler prevents 16-bit float gradients from underflowing to 0 during backprop
     scaler: GradScaler = GradScaler(device)
 
     # ------------------------------------------------------------------
     # CHECKPOINT RECOVERY SYSTEM
     # ------------------------------------------------------------------
     resume_checkpoint_path_from_recovery = None
-    resume_checkpoint_path_from_epoch = None
+    resume_checkpoint_path_from_epoch = os.path.join(WEIGHTS_FOLDER, "full_tune_epoch_17.pt")
     start_epoch = 0
     start_batch = 0
 
@@ -165,8 +190,6 @@ def main() -> None:
     # ------------------------------------------------------------------
     num_epochs: int = 100
     
-    # Effective Batch Size = physical_batch_size * accumulation_steps (2 * 8 = 16)
-    # This simulates a 16-batch size without exceeding GPU VRAM limits.
     physical_batch_size = 2
     accumulation_steps = 8  
 
@@ -197,52 +220,48 @@ def main() -> None:
         batch_size=physical_batch_size, 
         shuffle=True,
         num_workers=4,
-        pin_memory=True, # Speeds up CPU to GPU tensor transfers
-        drop_last=True   # Prevents BatchNorm crashes on irregular final batches
+        pin_memory=True, 
+        drop_last=True   
     )
 
-    # Tracking arrays for final plot generation
     tracked_epochs: list[int] = []
     tracked_losses: list[float] = []
-    save_frequency = 3000  # Generate an emergency backup every 3000 batches
+    save_frequency = 3000  
     
     # ==================================================================
     # CORE TRAINING LOOP
     # ==================================================================
     for epoch in range(start_epoch, num_epochs):
-        model.train() # Unlocks Dropout and BatchNorm updates
+        model.train() 
         running_loss: float = 0.0
         
-        # set_to_none=True is slightly faster and uses less memory than standard zero_grad()
         optimizer.zero_grad(set_to_none=True) 
         
         pbar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
         
         for batch_idx, (images, masks) in enumerate(pbar):
-            # Fast-forward condition for resuming from a mid-epoch crash
             if epoch == start_epoch and batch_idx < start_batch:
                 continue
                 
             images = images.to(device)
             masks = masks.to(device).long()
             
-            # 1. MIXED PRECISION FORWARD PASS
+            # 1. MIXED PRECISION FORWARD PASS (LOGITS ONLY)
             with torch.autocast(device_type=device.type):
                 logits: torch.Tensor = model(images)
-                loss: torch.Tensor = criterion(logits, masks)
-                # Scale down the loss so accumulating it mathematically matches a larger batch size
-                loss = loss / accumulation_steps
                 
-            # 2. SCALED BACKWARD PASS
+            # 2. LOSS CALCULATION OUTSIDE AUTOCAST
+            # This ensures Softmax and log(p) are done in safe float32 math
+            loss: torch.Tensor = criterion(logits, masks)
+            loss = loss / accumulation_steps
+                
+            # 3. SCALED BACKWARD PASS
             scaler.scale(loss).backward()
             
-            # 3. GRADIENT ACCUMULATION & OPTIMIZER STEP
-            # Only step the optimizer once we have accumulated enough gradients
+            # 4. GRADIENT ACCUMULATION & OPTIMIZER STEP
             if ((batch_idx + 1) % accumulation_steps == 0) or (batch_idx + 1 == len(train_dataloader)):
                 
-                # Unscale the gradients back to normal sizes before clipping
                 scaler.unscale_(optimizer)
-                # Gradient Clipping prevents ViT weights from exploding if a corrupted batch creates Infinite loss
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 
                 scaler.step(optimizer)
@@ -263,7 +282,6 @@ def main() -> None:
                 }
                 torch.save(checkpoint, mid_epoch_save_path)
 
-            # Re-multiply by accumulation_steps strictly for readable console logging
             running_loss += (loss.item() * accumulation_steps)
             pbar.set_postfix({"Loss": f"{(loss.item() * accumulation_steps):.4f}"})
             
@@ -276,10 +294,6 @@ def main() -> None:
         tracked_epochs.append(epoch + 1)
         tracked_losses.append(epoch_loss)
         
-        # ------------------------------------------------------------------
-        # SAFE CSV LOGGING
-        # Appends dynamically to protect history from terminal/server crashes
-        # ------------------------------------------------------------------
         file_exists = os.path.isfile(CSV_LOG_PATH)
         with open(CSV_LOG_PATH, mode='a', newline='') as csvfile:
             writer = csv.writer(csvfile)
@@ -287,9 +301,6 @@ def main() -> None:
                 writer.writerow(['Epoch', 'Average_Loss'])
             writer.writerow([epoch + 1, f"{epoch_loss:.6f}"])
 
-        # ------------------------------------------------------------------
-        # MODEL SAVING (.PT)
-        # ------------------------------------------------------------------
         pt_save_path = os.path.join(WEIGHTS_FOLDER, f"full_tune_epoch_{epoch+1}.pt")
         checkpoint = {
             'epoch': epoch + 1,
@@ -299,10 +310,6 @@ def main() -> None:
         }
         torch.save(checkpoint, pt_save_path)
         
-        # ------------------------------------------------------------------
-        # CLEANUP INTRA-EPOCH BACKUPS
-        # Removes the emergency backups for this epoch once the full epoch succeeds
-        # ------------------------------------------------------------------
         recovery_pattern = os.path.join(WEIGHTS_FOLDER, f"recovery_epoch_{epoch+1}_batch_*.pt")
         recovery_files = glob.glob(recovery_pattern)
         
