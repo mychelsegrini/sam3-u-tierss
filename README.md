@@ -99,7 +99,7 @@ python evaluate_epochs.py
 ```
 The output looks like this:
 
-![image](assets/validation_curve_final.png)
+![image](assets/validation_nu_loss_curve.png)
 
 ### 5. `process_folder.py`
 It runs semantic segmentation inference on an entire folder of images and exports multiple mask formats alongside JSON metadata for downstream processing.
@@ -120,9 +120,10 @@ It takes one of the epochs, a .pt file of your choice, and runs it on a batch of
 
 ### 7. `plot.py`
 
-It generates a plot from a .csv file with many metrics, and another plot with the IoUs in bars. See examples below:
+It generates two plots from a .csv file with many metrics (across classes and overall), and another plot with the IoUs in bars. See examples below:
 
 ![image](assets/metrics_example.png)
+![image](assets/metrics_overall_example.png)
 ![image](assets/iou_example.png)
 
 ## License
